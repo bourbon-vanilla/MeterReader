@@ -1,4 +1,5 @@
-﻿using Grpc.Core;
+﻿using Google.Protobuf.WellKnownTypes;
+using Grpc.Core;
 using MeterReaderWeb.Data;
 using MeterReaderWeb.Data.Entities;
 using Microsoft.Extensions.Logging;
@@ -20,6 +21,26 @@ namespace MeterReaderWeb.Services
             _readingRepository = readingRepository;
         }
 
+        public async override Task<Empty> Test(Empty request, ServerCallContext context)
+        {
+            return await base.Test(request, context);
+        }
+
+        public async override Task<Empty> SendDiagnostics(IAsyncStreamReader<ReadingMessage> requestStream, ServerCallContext context)
+        {
+            var task = Task.Run(async () =>
+            {
+                await foreach(var reading in requestStream.ReadAllAsync())
+                {
+                    _logger.LogInformation($"Received Reading: {reading}");
+                }
+            });
+
+            await task;
+
+            return new Empty();
+        }
+
         public async override Task<StatusMessage> AddReading(ReadingPaket request, ServerCallContext context)
         {
             var result = new StatusMessage { Success = ReadingStatus.Failure };
@@ -30,6 +51,18 @@ namespace MeterReaderWeb.Services
                 {
                     foreach(var r in request.Readings)
                     {
+                        if (r.ReadingValue < 1000)
+                        {
+                            _logger.LogDebug("Reading Value below acceptable level");
+                            var trailer = new Metadata()
+                            {
+                                { "BadValue", r.ReadingValue.ToString() },
+                                { "Field", nameof(r.ReadingValue) },
+                                { "Message", "Reading is to low" }
+                            };
+                            throw new RpcException(new Status(StatusCode.OutOfRange, "Value too low"), trailer);
+                        }
+
                         var reading = new MeterReading
                         {
                             Value = r.ReadingValue,
@@ -46,10 +79,14 @@ namespace MeterReaderWeb.Services
                         }
                     }
                 }
+                catch (RpcException)
+                {
+                    throw;
+                }
                 catch (Exception ex)
                 {
-                    result.Message = "Exception thrown during process";
                     _logger.LogError($"Xception during add reading action: {ex}");
+                    throw new RpcException(Status.DefaultCancelled, "Exception thrown during process");
                 }
             }
 
